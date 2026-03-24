@@ -56,13 +56,13 @@
 
 ### 4.1 比率与截断（policy clip）
 
-$$
-r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\text{old}}(a_t|s_t)}
-$$
+```math
+r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\mathrm{old}}(a_t|s_t)}
+```
 
-$$
-\tilde r_t(\theta)=\operatorname{clip}\left(r_t(\theta),\,1-\epsilon_{\text{low}},\,1+\epsilon_{\text{up}}\right)
-$$
+```math
+\tilde r_t(\theta)=\operatorname{clip}\left(r_t(\theta),\,1-\epsilon_{\mathrm{low}},\,1+\epsilon_{\mathrm{up}}\right)
+```
 
 - `r_t` 衡量“当前策略相对采样策略”的概率变化。
 - clip 的作用：限制单步更新幅度，防止个别样本造成过大梯度冲击。
@@ -70,14 +70,14 @@ $$
 ### 4.2 参考 KL 项
 
 设
-$$
-\Delta_t=\log\pi_{\text{ref}}(a_t|s_t)-\log\pi_\theta(a_t|s_t)
-$$
+```math
+\Delta_t=\log\pi_{\mathrm{ref}}(a_t|s_t)-\log\pi_\theta(a_t|s_t)
+```
 
 Megatron 实现使用：
-$$
+```math
 \mathrm{KL}_t=\exp(\Delta_t)-\Delta_t-1
-$$
+```
 
 性质：
 - 始终非负
@@ -86,38 +86,38 @@ $$
 
 ### 4.3 熵项
 
-$$
+```math
 H_t=-\pi_\theta(a_t|s_t)\log\pi_\theta(a_t|s_t)
-$$
+```
 
 在 loss 中通常是 `- alpha * H_t`，最小化 loss 等价于鼓励更高熵（防止策略过早塌缩到极尖分布）。
 
 ### 4.4 可选 IS 修正（inference correction）
 
-$$
-w_t=\exp\left(\log\pi_{\text{old}}(a_t|s_t)-\log\pi_{\text{inf}}(a_t|s_t)\right)
-$$
+```math
+w_t=\exp\left(\log\pi_{\mathrm{old}}(a_t|s_t)-\log\pi_{\mathrm{inf}}(a_t|s_t)\right)
+```
 
 可选截断：
-$$
+```math
 w_t\leftarrow\min(w_t,c)
-$$
+```
 
 作用：不是单纯“变小”，而是将由 `pi_inf` 采样得到的样本重新加权到更接近 `pi_old` 目标分布。
 
 ### 4.5 单 token 损失与 batch 聚合
 
-$$
+```math
 \mathcal L_t(\theta)=
 -\,w_t\,\min\!\big(r_t(\theta)A_t,\ \tilde r_t(\theta)A_t\big)
 +\beta\,\mathrm{KL}_t
 -\alpha\,H_t
-$$
+```
 
-$$
+```math
 \mathcal L(\theta)=
 \frac{\sum_t m_t\,\mathcal L_t(\theta)}{\sum_t m_t}
-$$
+```
 
 其中 `m_t` 是 loss mask。
 
@@ -145,19 +145,19 @@ $$
 - `global_batch_size=64`
 
 则：
-$$
+```math
 N_{\text{rollout}}=64\times16=1024
-$$
+```
 
 每次 collection 可支持全局更新步数：
-$$
+```math
 N_{\text{updates per collection}}=\frac{64\times16}{64}=16
-$$
+```
 
 若 `grpo_iterations=\mu`，则该批 rollout 可复用：
-$$
+```math
 N_{\text{updates total}}=\mu\cdot\frac{64\times16}{64}
-$$
+```
 
 数据流摘要：
 1. 采样得到 64 组，每组 16 条 trajectory
@@ -174,9 +174,9 @@ $$
 
 Megatron 这个 GRPO 路径中，`A_t` 不是来自 value network，而是来自组内标准化 reward：
 
-$$
+```math
 A_{g,i}=\frac{r_{g,i}-\mu_g}{\sigma_g+10^{-4}}
-$$
+```
 
 多轮对话时，会按 turn 展开/重复映射到训练样本。
 
