@@ -12,21 +12,21 @@
 
 ## 2. 权重更新主流程（从一轮 iteration 看）
 
-1. 准备参考策略 $\pi_{ref}$
+1. 准备参考策略 $`\pi_{ref}`$
 - RL 训练会构建固定参考权重 `ref_state_dict`（通常来自预训练/SFT权重），用于 KL 正则约束。
 
-2. 采样 rollout（得到 $\pi_{old}$ 数据）
+2. 采样 rollout（得到 $`\pi_{old}`$ 数据）
 - 根据 `grpo_iterations` 与缓存策略，决定本轮是否重新采样。
 - 若使用独立 inference model，会先把训练模型权重同步/交换到推理模型再采样。
 
 3. 预处理用于更新的数据
 - 将 rollout 转成训练张量（tokens、mask、position_ids 等）。
 - 计算两套关键 logprob：
-  - `old_logprobs`：采样策略侧（$\pi_{old}$）
-  - `ref_logprobs`：参考策略侧（$\pi_{ref}$）
+  - `old_logprobs`：采样策略侧（$`\pi_{old}`$）
+  - `ref_logprobs`：参考策略侧（$`\pi_{ref}`$）
 
 4. 前向与损失
-- 计算当前策略 $\pi_\theta$ 的 logprob。
+- 计算当前策略 $`\pi_\theta`$ 的 logprob。
 - 组成 GRPO 单 token loss（policy clip + KL + entropy + 可选 IS 修正）。
 
 5. 反向与参数更新
@@ -44,11 +44,11 @@
 
 问题：更新权重不是只看当前状态吗？
 
-结论：在 GRPO/PPO 类目标里，更新不仅依赖当前策略 $\pi_\theta$，还依赖：
-- $\pi_{old}$：用于离策略比率与 clipping（保证步子不过猛）
-- $\pi_{ref}$：用于 KL 正则（防止策略漂移过远）
+结论：在 GRPO/PPO 类目标里，更新不仅依赖当前策略 $`\pi_\theta`$，还依赖：
+- $`\pi_{old}`$：用于离策略比率与 clipping（保证步子不过猛）
+- $`\pi_{ref}`$：用于 KL 正则（防止策略漂移过远）
 
-没有 $\pi_{ref}$（或 KL 系数过低）时，模型容易过度追 reward，出现能力退化、风格漂移或 reward hacking。
+没有 $`\pi_{ref}`$（或 KL 系数过低）时，模型容易过度追 reward，出现能力退化、风格漂移或 reward hacking。
 
 ---
 
@@ -64,10 +64,10 @@ r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{old}(a_t|s_t)}
 \tilde r_t(\theta)=clip(r_t(\theta), 1-\epsilon_{low}, 1+\epsilon_{up})
 ```
 
-- $r_t$ 衡量“当前策略相对采样策略”的概率变化。
+- $`r_t`$ 衡量“当前策略相对采样策略”的概率变化。
 - clip 的作用：限制单步更新幅度，防止个别样本造成过大梯度冲击。
 
-#### 说白了，$r_t$ 就是在现在状态与之前的状态在当前 token 做当前动作的概率变化之比。为什么要 clip 呢？因为要让这个比值拥有一个上下界，不要让它一步更新太猛。
+#### 说白了，$`r_t`$ 就是在现在状态与之前的状态在当前 token 做当前动作的概率变化之比。为什么要 clip 呢？因为要让这个比值拥有一个上下界，不要让它一步更新太猛。
 ### 4.2 参考 KL 项
 
 设
@@ -82,7 +82,7 @@ KL_t=\exp(\Delta_t)-\Delta_t-1
 
 性质：
 - 始终非负
-- 当 $\pi_\theta$ 与 $\pi_{ref}$ 一致时为 0
+- 当 $`\pi_\theta`$ 与 $`\pi_{ref}`$ 一致时为 0
 - 偏离越大惩罚越强
 
 ### 4.3 熵项
@@ -91,9 +91,9 @@ KL_t=\exp(\Delta_t)-\Delta_t-1
 H_t=-\pi_\theta(a_t|s_t)\log\pi_\theta(a_t|s_t)
 ```
 
-在 loss 中通常是 $-\alpha H_t$，最小化 loss 等价于鼓励更高熵（防止策略过早塌缩到极尖分布）。
+在 loss 中通常是 $`-\alpha H_t`$，最小化 loss 等价于鼓励更高熵（防止策略过早塌缩到极尖分布）。
 
-#### 因为 $-x \log x$ 是一个在 $(0,1]$ 上大于 0 的函数，趋于 0 和 1 时都是 0，这样可以防止它选择太极端的概率（0 或 1）。
+#### 因为 $`-x \log x`$ 是一个在 $`(0,1]`$ 上大于 0 的函数，趋于 0 和 1 时都是 0，这样可以防止它选择太极端的概率（0 或 1）。
 
 ### 4.4 可选 IS 修正（inference correction）
 
@@ -106,8 +106,8 @@ w_t=\exp(\log \pi_{old}(a_t|s_t)-\log \pi_{inf}(a_t|s_t))
 w_t = \min(w_t, c)
 ```
 
-作用：不是单纯“变小”，而是将由 $\pi_{inf}$ 采样得到的样本重新加权到更接近 $\pi_{old}$ 目标分布。
-#### 因为更新是从 $\pi_{ref}$ 做更新的，但是推理出的 reward 是从 $\pi_{inf}$ 的状态推出来的，两者拥有偏差，通过对 $\pi_{inf}$ 加一些修正让其更加接近 $\pi_{ref}$ 的分布。
+作用：不是单纯“变小”，而是将由 $`\pi_{inf}`$ 采样得到的样本重新加权到更接近 $`\pi_{old}`$ 目标分布。
+#### 因为更新是从 $`\pi_{ref}`$ 做更新的，但是推理出的 reward 是从 $`\pi_{inf}`$ 的状态推出来的，两者拥有偏差，通过对 $`\pi_{inf}`$ 加一些修正让其更加接近 $`\pi_{ref}`$ 的分布。
 ### 4.5 单 token 损失与 batch 聚合
 
 ```math
@@ -122,16 +122,16 @@ w_t = \min(w_t, c)
 \frac{\sum_t m_t \mathcal L_t(\theta)}{\sum_t m_t}
 ```
 
-其中 $m_t$ 是 loss mask。
+其中 $`m_t`$ 是 loss mask。
 
 ---
 
 ## 5. 符号解释
 
-- $\pi_\theta(a_t|s_t)$：当前策略在状态 $s_t$ 下选择动作/token $a_t$ 的条件概率。
-- $s_t$：当前上下文状态（prompt + 已生成前缀）。
-- $a_t$：当前步生成的 token。
-- $\pi_\theta(a_t|s_t)$ 取值区间：理论上 $(0,1]$。
+- $`\pi_\theta(a_t|s_t)`$：当前策略在状态 $`s_t`$ 下选择动作/token $`a_t`$ 的条件概率。
+- $`s_t`$：当前上下文状态（prompt + 已生成前缀）。
+- $`a_t`$：当前步生成的 token。
+- $`\pi_\theta(a_t|s_t)`$ 取值区间：理论上 $`(0,1]`$。
 
 当策略塌缩为尖锐分布时：
 - 少数 token 概率接近 1
@@ -173,9 +173,9 @@ N_{updatesTotal}=\mu \cdot \frac{64 \times 16}{64}
 
 ---
 
-## 7. Advantage（$A_t$）怎么来
+## 7. Advantage（$`A_t`$）怎么来
 
-Megatron 这个 GRPO 路径中，$A_t$ 不是来自 value network，而是来自组内标准化 reward：
+Megatron 这个 GRPO 路径中，$`A_t`$ 不是来自 value network，而是来自组内标准化 reward：
 
 ```math
 A_{g,i}=\frac{r_{g,i}-\mu_g}{\sigma_g+10^{-4}}
@@ -202,4 +202,4 @@ A_{g,i}=\frac{r_{g,i}-\mu_g}{\sigma_g+10^{-4}}
 
 ## 9. 一句话总结
 
-Megatron 的 GRPO 更新不是“只看当前策略”单点优化，而是通过 $\pi_{old}$（稳定步长）+ $\pi_{ref}$（防漂移）+ advantage 标准化（降方差）共同约束，再进入 Megatron 标准反传与优化器更新链路，完成稳定的 RL 微调。
+Megatron 的 GRPO 更新不是“只看当前策略”单点优化，而是通过 $`\pi_{old}`$（稳定步长）+ $`\pi_{ref}`$（防漂移）+ advantage 标准化（降方差）共同约束，再进入 Megatron 标准反传与优化器更新链路，完成稳定的 RL 微调。
