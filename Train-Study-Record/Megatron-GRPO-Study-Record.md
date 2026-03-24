@@ -57,11 +57,11 @@
 ### 4.1 比率与截断（policy clip）
 
 ```math
-r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\mathrm{old}}(a_t|s_t)}
+r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{old}(a_t|s_t)}
 ```
 
 ```math
-\tilde r_t(\theta)=\operatorname{clip}\left(r_t(\theta),\,1-\epsilon_{\mathrm{low}},\,1+\epsilon_{\mathrm{up}}\right)
+\tilde r_t(\theta)=clip(r_t(\theta), 1-\epsilon_{low}, 1+\epsilon_{up})
 ```
 
 - `r_t` 衡量“当前策略相对采样策略”的概率变化。
@@ -71,12 +71,12 @@ r_t(\theta)=\frac{\pi_\theta(a_t|s_t)}{\pi_{\mathrm{old}}(a_t|s_t)}
 
 设
 ```math
-\Delta_t=\log\pi_{\mathrm{ref}}(a_t|s_t)-\log\pi_\theta(a_t|s_t)
+\Delta_t=\log \pi_{ref}(a_t|s_t)-\log \pi_\theta(a_t|s_t)
 ```
 
 Megatron 实现使用：
 ```math
-\mathrm{KL}_t=\exp(\Delta_t)-\Delta_t-1
+KL_t=\exp(\Delta_t)-\Delta_t-1
 ```
 
 性质：
@@ -95,12 +95,12 @@ H_t=-\pi_\theta(a_t|s_t)\log\pi_\theta(a_t|s_t)
 ### 4.4 可选 IS 修正（inference correction）
 
 ```math
-w_t=\exp\left(\log\pi_{\mathrm{old}}(a_t|s_t)-\log\pi_{\mathrm{inf}}(a_t|s_t)\right)
+w_t=\exp(\log \pi_{old}(a_t|s_t)-\log \pi_{inf}(a_t|s_t))
 ```
 
 可选截断：
 ```math
-w_t\leftarrow\min(w_t,c)
+w_t = \min(w_t, c)
 ```
 
 作用：不是单纯“变小”，而是将由 `pi_inf` 采样得到的样本重新加权到更接近 `pi_old` 目标分布。
@@ -109,14 +109,14 @@ w_t\leftarrow\min(w_t,c)
 
 ```math
 \mathcal L_t(\theta)=
--\,w_t\,\min\!\big(r_t(\theta)A_t,\ \tilde r_t(\theta)A_t\big)
-+\beta\,\mathrm{KL}_t
--\alpha\,H_t
+-w_t \min(r_t(\theta)A_t, \tilde r_t(\theta)A_t)
++\beta KL_t
+-\alpha H_t
 ```
 
 ```math
 \mathcal L(\theta)=
-\frac{\sum_t m_t\,\mathcal L_t(\theta)}{\sum_t m_t}
+\frac{\sum_t m_t \mathcal L_t(\theta)}{\sum_t m_t}
 ```
 
 其中 `m_t` 是 loss mask。
@@ -146,17 +146,17 @@ w_t\leftarrow\min(w_t,c)
 
 则：
 ```math
-N_{\text{rollout}}=64\times16=1024
+N_{rollout}=64 \times 16=1024
 ```
 
 每次 collection 可支持全局更新步数：
 ```math
-N_{\text{updates per collection}}=\frac{64\times16}{64}=16
+N_{updatesPerCollection}=\frac{64 \times 16}{64}=16
 ```
 
 若 `grpo_iterations=\mu`，则该批 rollout 可复用：
 ```math
-N_{\text{updates total}}=\mu\cdot\frac{64\times16}{64}
+N_{updatesTotal}=\mu \cdot \frac{64 \times 16}{64}
 ```
 
 数据流摘要：
