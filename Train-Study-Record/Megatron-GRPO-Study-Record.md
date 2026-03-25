@@ -140,7 +140,7 @@ w_t = \min(w_t, c)
 
 ---
 
-## 6. 一轮 rollout 后的数据流（示例）
+## 6. 一轮 rollout 后的数据流（Megatron训练流程为例）
 
 假设：
 - `grpo_prompts_per_step=64`
@@ -162,14 +162,34 @@ N_{updatesPerCollection}=\frac{64 \times 16}{64}=16
 N_{updatesTotal}=\mu \cdot \frac{64 \times 16}{64}
 ```
 
-数据流摘要：
-1. 采样得到 64 组，每组 16 条 trajectory
-2. 组内 reward 标准化得到 advantage
-3. 按 DP rank 切分样本
-4. 构建训练输入张量
-5. 预计算 `old_logprobs` 与 `ref_logprobs`
-6. 进入训练循环，按 microbatch 进行 forward/backward
-7. 调用 `optimizer.step()` 完成参数更新
+## 数据流摘要：
+### 1. 采样得到 64 组，每组 16 条 trajectory
+### 2. 组内 reward 标准化得到 advantage
+### 3. 按 DP rank 切分样本
+在这一步里 会对rollout sample及其advantage按DP rank切（只有DP切 其他rank会共享DPrank的本地shard）
+### 4. 构建训练输入张量
+这一步本质是将 `prompt` + `trajectory` + `padding` 构建成tensor (token_ids) 
+除此以外，还会构建mask，主要是两个mask: `gen_mask`和`loss_mask`，分别代表的是
+- 哪一部分是generation trajectory
+- 哪一部分是Loss哪些位置最终参与Loss计算
+### 5. 预计算 `old_logprobs` 与 `ref_logprobs`
+计算logprobs的本质是 将打包后的输入张量，给模型跑一次类似于Prefill的前向，获得对每一个token的logit和hidden_state，然后算logprob方便对比$`\pi_{old}`$和$`\pi_{cur}`$。
+
+logprob = [ <br>
+  log ( softmax ( P ( token_1 | token_0 ) ) ), <br>
+  log ( softmax ( P ( token_2 | token_0,token_1 ) ) ), <br>
+  ... <br>
+]
+
+对同一条trajectory，old和ref的logprobs是在不同时间算出来的。
+- old_logprob 是在rollout结束 使用old_weight对trajectory进行计算算出来的
+- ref_logprob 是保存cur_weight的dict_state之后做了一个weightswap进行计算出来的 
+
+
+### 6. 进入训练循环，按 microbatch 进行 forward/backward
+
+实际上到这一步就是进行在做 进行前向-> 算GRPO loss ->加权反向传播了。
+### 7. 调用 `optimizer.step()` 完成参数更新
 
 ---
 
