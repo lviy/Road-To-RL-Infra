@@ -264,10 +264,6 @@ flowchart TD
     class F,F1,G,G1,H,I,J,K finish
 ```
 
-
-
-
-
 ### 2.3 新 token 怎么长上去
 
 假设 `A` 当前已经很长了，现在又生成了一个新 token。
@@ -361,6 +357,39 @@ flowchart TD
 - 新 token 继续按 `interleave / round-robin` 追加到不同 rank
 - 短尾结束后释放 shard，新 seq 再补进来
 
+### 2.7 DCP 相比不做 DCP，多了什么开销，换来了什么收益
+
+先看不做 DCP 的情况。
+
+对同一个 decode step 来说，如果一条 seq 的历史 KV 全都放在一张卡上，那么这一张卡就能在本地直接完成这一步 attention。
+
+这意味着：
+
+- 跨卡通信更少
+- 这一层的 attention 路径更直接
+- 但这张卡要独自承担这条 seq 的全部历史 KV 存储和读取压力
+
+再看做了 DCP 之后。
+
+这一步的 query 还是当前 token 对应的那个 query，本身没有变；变的是这条 seq 的历史 KV 已经分散在多个 CP rank 上。
+
+所以每个 rank 这一步只能先对自己本地那一段 KV 算 partial attention，随后还要跨 rank 做一次聚合，才能还原出这条 seq 在全历史上的完整 attention 结果。
+
+因此 DCP 多出来的开销，主要是：
+
+- 每个 decode step 都多了跨卡通信和同步
+- attention 结果不是单卡本地一步做完，而是要先分片算、再聚合
+- 调度和实现也会更复杂一些
+
+但它换来的收益也很明确：
+
+- 整条长上下文的 KV cache 不再集中压在一张卡上
+- 每张卡只需要存自己那一段历史 KV
+- 每张卡也只需要读取自己那一段历史 KV 来参与这一步 attention
+- 所以长上下文下的 KV 显存压力、历史 attention 读取压力，都被分摊到了多张卡上
+
+一句话记住：**不做 DCP，是通信更少，但一张卡扛下整条长上下文；做了 DCP，是通信更多，但多张卡一起分担长上下文的负担。**
+
 ## 3. 为什么要有 CP，而不是只用 TP
 
 只用 `TP` 有两个常见问题：
@@ -391,16 +420,66 @@ flowchart TD
 
 ## 5. 它和 MTP 放在一起看是什么意思
 
-`MTP` 通常指 `Multi-Token Prediction`，即一次 decode 尝试预测多个 token，目的是提高生成吞吐、减少逐 token 解码带来的低效率。
+`MTP` 通常指 `Multi-Token Prediction`，也就是一次先提出多个 draft token，再由主模型做 verify，看看这轮最终能接受几个 token。
 
-把 `DCP + MTP` 放在一起看时，可以这样理解：
+所以它的关键不是“彻底绕开主模型 decode”，而是：
 
-- `DCP` 解决的是 **长上下文下，decode 阶段 KV cache 和注意力计算怎么摊到多卡**；
-- `MTP` 解决的是 **decode 阶段一次只出 1 个 token 太慢**；
-- 前者更偏 **显存 / 并行切分**；
-- 后者更偏 **吞吐 / 解码效率**。
+- 先用更轻的 draft 路径往前猜多个 token
+- 再用一次较重的 verify 去确认这些候选
+- 如果一轮能接受多个 token，那么平均到每个 token 上的主干开销就会下降
 
-所以这两个技术经常会被放在一起讨论，因为它们都在优化推理系统里最贵的那一段：`decode`。
+从这个角度看：
+
+- `DCP` 解决的是 **长上下文下，decode 阶段 KV cache 和历史 attention 怎么摊到多卡**；
+- `MTP` 解决的是 **逐 token decode 太细、太慢，想办法让一轮多前进几个 token**；
+- 前者更偏 **显存 / 上下文切分**；
+- 后者更偏 **吞吐 / 单 token 成本摊薄**。
+
+但把两者放在一起时，还要注意一个额外问题：**MTP 把主干计算摊薄以后，DCP 的跨卡通信占比会变得更显眼。**
+
+可以先用一个很粗的系统视角来比较。
+
+假设还是 4 张卡做 DCP，不开 MTP 时，如果要确认生成 `n` 个 token，那么大致可以看成经历了 `n` 次常规 decode step。每一步都包含：
+
+- 一次完整 decode forward
+- 一次 DCP 下的跨 rank 通信 / 聚合
+- 一次调度与 KV 追加开销
+
+因此总开销可以粗略记成：
+
+- 不开 MTP：`n * (full_forward + cp_comm + sched)`
+
+如果开启 MTP，并且一轮最多先猜 `3` 个 draft token，那么这一轮的成本更接近：
+
+- `3` 次轻量级的 MTP draft 计算
+- `1` 次主模型 verify
+- 这一轮对应的 DCP 通信与调度开销
+
+于是可以粗略写成：
+
+- 开 MTP，一轮最多猜 3 个：`3 * mtp_forward + verify_forward + cp_comm' + sched'`
+
+如果这一轮最终接受了 `n` 个 token（这里 `n <= 3`），那么平均到每个 accepted token 上的成本大约是：
+
+- `（3 * mtp_forward + verify_forward + cp_comm' + sched'） / n`
+
+这里最重要的直觉不是公式本身，而是：
+
+- `MTP` 的收益来自 **把一次 verify 和若干次 draft 的成本，摊到多个最终接受的 token 上**；
+- 但在 `DCP` 下，随着主干计算被摊薄，**跨 rank 通信、同步、调度** 在总耗时里的占比会变高；
+- 所以上下文越长、CP 组越大，这部分额外开销就越不能忽略。
+
+如果再考虑 continuous batching，事情会更像真实系统：
+
+- 不同 seq 在同一轮里接受的 token 数可能不一样
+- 有的 seq 这轮接受 `3` 个，有的只接受 `1` 个，有的可能直接结束
+- 但这不会破坏 DCP，因为每条 seq 只要维护自己的已接受长度，新 token 继续按 DCP 的分片规则写入对应 rank 即可
+
+所以 `DCP + MTP` 可以记成一句话：
+
+- `MTP` 负责让 decode 一轮尽量多前进几个 token；
+- `DCP` 负责让这些已接受 token 的长历史 KV 不要集中压在一张卡上；
+- 两者结合后，常见的新瓶颈不再只是主干计算，而是 **通信、同步和调度是否还能跟得上**。
 
 ## 6. 一句话总结
 
