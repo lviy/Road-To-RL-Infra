@@ -437,36 +437,68 @@ flowchart TD
 
 但把两者放在一起时，还要注意一个额外问题：**MTP 把主干计算摊薄以后，DCP 的跨卡通信占比会变得更显眼。**
 
-可以先用一个很粗的系统视角来比较。
+可以先用一个更贴近 runtime 的粗粒度视角来比较。
 
 假设还是 4 张卡做 DCP，不开 MTP 时，如果要确认生成 `n` 个 token，那么大致可以看成经历了 `n` 次常规 decode step。每一步都包含：
 
-- 一次完整 decode forward
-- 一次 DCP 下的跨 rank 通信 / 聚合
-- 一次调度与 KV 追加开销
+- 一次 target model 的 decode forward
+- 一次这步 decode 对应的 DCP 通信 / 聚合
+- 一次 scheduler 推进 decode batch、回写结果、追加 KV 的开销
 
 因此总开销可以粗略记成：
 
-- 不开 MTP：`n * (full_forward + cp_comm + sched)`
+- 不开 MTP：`n * (target_decode_forward + cp_comm_decode + sched_decode)`
 
-如果开启 MTP，并且一轮最多先猜 `3` 个 draft token，那么这一轮的成本更接近：
+如果开启 MTP，要更小心一点：**不能把一整轮 speculative 只看成“1 次 cp_comm”**。
 
-- `3` 次轻量级的 MTP draft 计算
-- `1` 次主模型 verify
-- 这一轮对应的 DCP 通信与调度开销
+原因是 SGLang 里的 MTP 是挂在 speculative decoding 流程里的，一轮 speculative 通常更接近：
+
+1. 先有一个当前步的 target decode / target 起始 token
+2. 然后 draft 侧按 speculative step 逐步往前 rollout
+3. 最后 target 再做一次 verify forward
+
+如果这一轮 draft 实际 rollout 了 `k` 步，那么整轮成本更接近：
+
+- `1` 次起始 target decode
+- `k` 次 draft forward
+- `1` 次 verify forward
+- 以及这一整轮 speculative 状态准备、accepted prefix 回写、KV / hidden state 更新的调度开销
 
 于是可以粗略写成：
 
-- 开 MTP，一轮最多猜 3 个：`3 * mtp_forward + verify_forward + cp_comm' + sched'`
+- 开 MTP，draft rollout `k` 步：`target_decode_start + k * (draft_forward + cp_comm_draft) + (verify_forward + cp_comm_verify) + sched_spec`
 
-如果这一轮最终接受了 `n` 个 token（这里 `n <= 3`），那么平均到每个 accepted token 上的成本大约是：
+如果这一轮最终接受了 `n` 个 token，那么平均到每个 accepted token 上的成本大约是：
 
-- `（3 * mtp_forward + verify_forward + cp_comm' + sched'） / n`
+- `（target_decode_start + k * (draft_forward + cp_comm_draft) + verify_forward + cp_comm_verify + sched_spec） / n`
+
+这里有两个很重要的点：
+
+- 这里的 `k` 是 **实际的 draft forward 步数**，不是“理论上最多猜几个 token”这么简单。
+- `cp_comm_draft` 和 `cp_comm_verify` 也不表示底层严格只有“一次 NCCL 通信”，而是说：**每一次 draft/verify forward 都会带来它各自那一轮 DCP 侧的跨卡通信与同步成本**。
+
+所以如果一句话概括成最粗的性能直觉，就是：
+
+- 不开 MTP：每确认 1 个 token，做 1 次 target decode 和 1 次对应的 DCP 通信
+- 开 MTP：想一次多前进几个 token，但代价是 **draft forward 会随着 rollout 步数持续吃 DCP 开销，而且 verify forward 也同样有 DCP 开销**
+
+再看 scheduler 开销，直觉上也不要把它想成“开了 MTP 就自动消失”。
+
+更接近真实系统的理解是：
+
+- scheduler 外层仍然是同一个 `run_batch -> process_batch_result` 主循环
+- 也就是说，大框架并没有因为 MTP 变成另一套完全不同的调度器
+- 但 speculative batch 内部会多出 draft / verify 状态准备、accepted length 处理、暂存 token/KV 的提交与丢弃、下一轮 draft 输入构造等工作
+
+所以如果只做粗粒度建模，更合理的理解是：
+
+- `sched_spec` 通常和 `sched_decode` 是同一量级，很多时候还会略高一点
+- 它不是 0，也不太适合直接当成比不开 MTP 更小的常数
 
 这里最重要的直觉不是公式本身，而是：
 
 - `MTP` 的收益来自 **把一次 verify 和若干次 draft 的成本，摊到多个最终接受的 token 上**；
-- 但在 `DCP` 下，随着主干计算被摊薄，**跨 rank 通信、同步、调度** 在总耗时里的占比会变高；
+- 但在 `DCP` 下，随着主干计算被摊薄，**draft 阶段逐步 forward 带来的通信、verify 阶段的通信、以及调度与状态管理** 在总耗时里的占比都会更显眼；
 - 所以上下文越长、CP 组越大，这部分额外开销就越不能忽略。
 
 如果再考虑 continuous batching，事情会更像真实系统：
@@ -479,13 +511,184 @@ flowchart TD
 
 - `MTP` 负责让 decode 一轮尽量多前进几个 token；
 - `DCP` 负责让这些已接受 token 的长历史 KV 不要集中压在一张卡上；
-- 两者结合后，常见的新瓶颈不再只是主干计算，而是 **通信、同步和调度是否还能跟得上**。
+- 两者结合后，常见的新瓶颈不再只是主干计算，而是 **draft + verify 带来的通信，以及这些 speculative 状态是否还能被调度器高效地推进和回写**。
 
-## 6. 一句话总结
+### 5.1 再往下一层看：不开 MTP / 开 MTP 时，一个 forward 大致会经过哪些 kernel
 
-在这份 `DCP + MTP` 的语境里：
+下面这个部分不是在逐个对照 Nsight trace，而是基于 `sglang` 当前实现，给一个**足够接近 runtime 结构的 kernel 级粗模型**。
 
-- `CP = Context Parallel`
-- `DCP = Decode Context Parallel`
+这里先固定一个简化前提，方便估算：
 
-它不是切模型参数，而是切上下文序列；它重点解决的是长上下文 decode 时的 `KV cache` 和 attention 压力。
+- 还是上面那个 **4 卡 DCP** 的例子
+- 以 `hidden_size = 2048` 的模型举例
+- 以 **H100** 作为粗估硬件基线
+- 只抓 decode / speculative 这条主路径里最关键的 kernel 类型
+- 不去细分不同 attention backend 下所有微小差异，也不展开 MoE/量化的额外分支
+
+#### 5.1.1 不开 MTP：一个 decode forward 里最核心的 kernel
+
+如果不开 MTP，那么对“确认 1 个 token”来说，最核心的一次 forward 大致会包含这些 kernel / 通信类型：
+
+1. **embedding / 小规模 gather**
+   - 把当前 token id 变成 embedding
+2. **RMSNorm / fused add + RMSNorm**
+   - SGLang 里常走 fused norm kernel
+3. **Q/K/V 线性层 GEMM**
+   - 包括 q_proj / kv_proj 或融合后的投影
+4. **RoPE / position 相关 kernel**
+5. **decode attention kernel**
+   - 在 SGLang 里通常会落到 flashinfer / triton / TRTLLM MLA 一类 attention backend
+6. **DCP 侧通信**
+   - 对 partial attention 结果做跨卡规约 / 聚合
+7. **output projection GEMM**
+8. **MLP / gate_up_proj / SiLU / down_proj**
+9. **lm_head GEMM + logits 处理 / sample**
+
+从代码路径上看，和这个判断最相关的是：
+
+- `deepseek_nextn.py` 里会在 CP 场景下做 `cp_split_and_rebuild_data(...)` / `cp_all_gather_rerange_output(...)`
+- `deepseek_v2.py` 里 attention 主体会走 MLA / RadixAttention / flashinfer 一类实现
+- `layernorm.py` 里 norm 常走 fused RMSNorm kernel
+- `linear.py` 里各类 projection / MLP 最终都对应 GEMM 类 kernel
+
+因此，不开 MTP 时，一个 token 的粗公式可以再展开一层，写成：
+
+- 不开 MTP，单 token：
+  `T_no_mtp ≈ T_embed + T_norm + T_qkv_gemm + T_rope + T_attn + T_cp_reduce + T_o_proj + T_mlp + T_lm_head + T_sched`
+
+这里的 `T_cp_reduce` 不表示只有一个底层 kernel，而是把 DCP 下这一层 forward 里最核心的跨卡通信折成一个粗项。
+
+#### 5.1.2 开 MTP：一个 speculative 轮次里最核心的 kernel
+
+开 MTP 以后，要分成三段看：
+
+1. **起始 target decode**
+   - 本质上和不开 MTP 的单步 decode 很像
+2. **draft rollout（重复 `k` 次）**
+   - 每一步都要再做一次 draft forward
+   - MTP/NextN 额外多出来的典型 kernel 是：
+     - token embedding
+     - 两个 RMSNorm（token hidden + target hidden）
+     - `eh_proj / input_proj` 这类把 `embed(token)` 和 `hidden_state` 拼起来再投影的 GEMM
+     - draft decoder block 内部自己的 attention / MLP / output head
+     - 以及这一步 draft forward 对应的 DCP 通信
+3. **verify forward**
+   - 再用 target model 对候选 token 做一次 verify
+   - 这一步本质上又是一轮 target-side forward，因此同样带 attention / GEMM / DCP 通信
+
+于是一个 speculative 轮次可以粗略展开成：
+
+- 开 MTP，一轮 draft `k` 步：
+  `T_mtp_round ≈ T_target_start + k * (T_mtp_embed + T_mtp_norm + T_eh_proj + T_mtp_attn + T_mtp_mlp + T_mtp_head + T_cp_draft) + (T_verify_forward + T_cp_verify) + T_sched_spec`
+
+如果只关心和不开 MTP 相比“多出来什么”，可以抓住两点：
+
+- 多出来的不只是 `k` 次 draft compute，**还多了 `k` 次 draft-side DCP 通信**
+- verify 不是白送的，**verify 自己也再走一次 target-side forward + DCP 通信**
+
+### 5.2 用 H100 + GLM-4.7-Flash 做一个非常粗的时间估计
+
+- 假设 **4 卡 DCP**
+- 以 **H100** 作为粗估硬件基线
+- 以 **GLM-4.7-Flash（47 layers）** 为例
+- 把 GEMM / norm / attention / comm 压缩成“每层、每 token”的粗项
+- 最终目的是估算：**开 MTP 后，理论上哪些项更容易开始主导总时延**
+
+#### 5.2.1 先给一个更接近 47 层模型的直觉
+
+如果只按最粗的“层数占比”去看，那么：
+
+- target 单 token forward 需要走完整的 `47` 层 stack
+- 而 MTP draft 如果近似成 **1 个 nextn / mtp block**
+- 那么它的**理想 compute 深度占比**大约就是：`1 / 47`
+
+所以如果先不把额外固定项放大，只抓最粗的层数缩放直觉，可以写成：
+
+- `T_draft,ideal ≈ T_target_stack / 47`
+
+如果把 GLM-4.7-Flash 的单 token target stack 粗记成 `~47 us`，那么：
+
+- `T_draft,ideal ≈ 1 us`
+
+这里要注意：这个 `1 us` 更接近 **按层数线性缩放得到的理想 compute 项**，不是严格的 wall-clock 下界。
+
+因为真实 draft step 里通常还会叠加：
+
+- embedding / token gather
+- hidden norm / token norm
+- `eh_proj / input_proj / fc`
+- 这 1 层自己的 attention 与 DCP 通信
+- lm_head / logits 处理
+- kernel launch 和 runtime 固定项
+
+所以更工程化一点的写法是：
+
+- `T_draft ≈ T_draft,ideal + T_fixed_overhead`
+- 对这个例子，可以把单步 draft 粗记成 **`~1-2 us` 量级**
+
+#### 5.2.2 再把它折成整轮时间
+
+为了给一个更具体的数，再继续做一个简单近似：
+
+- 假设 target 的完整 stack 粗记为 `47 us`
+- 假设每步 MTP draft 粗记为 `1 us`
+- 假设 verify 仍然要再走一轮 target-side forward，粗记为 `47 us`
+- 再给 scheduler / 状态回写预留一个粗项 `10 ~ 15 us`
+
+那么：
+
+- **不开 MTP，确认 1 个 token**
+  `T_no_mtp_token ≈ 47 + 12 ≈ 59 us`
+
+如果开 MTP，并且这一轮 draft rollout `k = 3` 步，最后接受 `n = 3` 个 token，那么：
+
+- 起始 target decode：`≈ 47 us`
+- 3 次 draft：`≈ 3 * 1 = 3 us`
+- verify：`≈ 47 us`
+- speculative 调度与状态处理：`≈ 12 us`
+
+于是整轮大约：
+
+- `T_mtp_round ≈ 47 + 3 + 47 + 12 = 109 us`
+
+平均到每个 accepted token：
+
+- `T_mtp_avg ≈ 109 / 3 ≈ 36 us / token`
+
+和不开 MTP 的 `~59 us / token` 相比，理论上就有：
+
+- `59 / 36 ≈ 1.6x`
+
+左右的粗收益。
+
+但如果同样是 `k = 3`，这一轮最后只接受了 `n = 1` 个 token，那么：
+
+- `T_mtp_avg ≈ 109 / 1 = 109 us / token`
+
+这就会比不开 MTP 更差。
+
+#### 5.2.3 这个粗公式真正想说明什么
+
+所以在 DCP 前提下，一个更有用的理论直觉是：
+
+- 不开 MTP：
+  `T_no_mtp_token ≈ T_target_stack + T_sched`
+- 开 MTP：
+  `T_mtp_avg ≈ (T_target_start + k * (T_draft_stack + T_cp_draft + T_fixed_overhead) + T_verify_stack + T_cp_verify + T_sched_spec) / n_accept`
+
+其中最关键的不是把每个数字卡到极准，而是这几个方向：
+
+1. **`n_accept` 决定 MTP 值不值**
+   - 接受率高，verify 成本才有机会被摊薄
+2. **`k` 增加时，draft compute 和 draft-side DCP 通信会一起增长**
+   - 不是只涨算力项
+3. **即便 `T_draft,ideal ≈ 1 us`，真实 draft wall-clock 也不会严格等于 `1 / 47` 个 target forward**
+   - 因为还有 projector / norm / head / launch / comm 这些固定项
+4. **verify 在 DCP 下仍然是重项**
+   - 它不是一个几乎可以忽略的小尾巴
+5. **scheduler 项不会消失**
+   - speculative 的 accepted prefix 管理、cache 提交/丢弃、下一轮 draft 输入构造，都会继续吃 CPU/runtime 开销
+
+所以如果把第 5 节压成一句更工程化的话，就是：
+
+- `DCP + MTP` 是否划算，不只看 MTP draft 层数是不是只剩 `1 / 47`，还要看 **draft rollout 带来的额外 DCP 通信、verify 的 target-side 成本，以及最终 accepted tokens 能不能把这些固定成本摊薄**。
