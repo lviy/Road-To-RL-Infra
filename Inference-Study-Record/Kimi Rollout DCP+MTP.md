@@ -680,12 +680,13 @@ flowchart TD
 
 1. **`n_accept` 决定 MTP 值不值**
    - 接受率高，verify 成本才有机会被摊薄
+   - Hint: sglang bench_speculative.py 可以测 accept_len * steps / second , 可以作为衡量spec kernel 吞吐量的指标
 2. **`k` 增加时，draft compute 和 draft-side DCP 通信会一起增长**
    - 不是只涨算力项
 3. **即便 `T_draft,ideal ≈ 1 us`，真实 draft wall-clock 也不会严格等于 `1 / 47` 个 target forward**
    - 因为还有 projector / norm / head / launch / comm 这些固定项
 4. **verify 在 DCP 下仍然是重项**
-   - 它不是一个几乎可以忽略的小尾巴
+   - 它不是一个几乎可以忽略的小尾巴，因为verify仍然需要经过整个网络，计算量远大于轻量化的MTP layer(但是此时就是compute-bound)
 5. **scheduler 项不会消失**
    - speculative 的 accepted prefix 管理、cache 提交/丢弃、下一轮 draft 输入构造，都会继续吃 CPU/runtime 开销
 
